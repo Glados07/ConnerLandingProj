@@ -1,6 +1,7 @@
 #include <ros/ros.h>
 
 #include <mavros_msgs/State.h>
+#include <mavros_msgs/AttitudeTarget.h>
 #include <geometry_msgs/PoseStamped.h>
 #include <geometry_msgs/TwistStamped.h>
 #include <geometry_msgs/Vector3.h>
@@ -38,11 +39,17 @@ private:
     landing_planner::PlanRequest plan_request;
     ros::Subscriber plan_request_sub;
 
+    // Takeoff state management
+    bool takeoff_completed;
+    ros::Time exec_start_time;
+
 // Publishers
     ros::Publisher planned_traj_pub;
+    ros::Publisher att_motion_cmd_pub;
+    ros::Publisher tkof_cmd_pub;
 
 public:
-    Planner(float rate_hz) : rate(rate_hz), plan_request_received(false){
+    Planner(float rate_hz) : rate(rate_hz), plan_request_received(false), takeoff_completed(false){
     // Subscribers
         state_sub = nh.subscribe<mavros_msgs::State>("mavros/state", 10, &Planner::state_cb, this);
         local_pos_sub = nh.subscribe<geometry_msgs::PoseStamped>("mavros/local_position/pose", 10, &Planner::local_pos_cb, this);
@@ -51,6 +58,8 @@ public:
         plan_request_sub = nh.subscribe<landing_planner::PlanRequest>("plan_request", 10, &Planner::plan_request_cb, this);
     // Publishers
         planned_traj_pub = nh.advertise<landing_planner::Trajectory>("planned_trajectory", 10);
+        att_motion_cmd_pub = nh.advertise<mavros_msgs::AttitudeTarget>("mavros/setpoint_raw/attitude", 10);
+        tkof_cmd_pub = nh.advertise<std_msgs::Bool>("tkof_cmd", 10);
     }
 
     void run(){
@@ -114,36 +123,77 @@ private:
         geometry_msgs::Vector3 target_acc = calculate_end_thrust_acc(target_pos);
         double duration = plan_request.duration;
 
+        // First-time takeoff phase
+        if (!takeoff_completed) {
+            ROS_INFO("Planner: Starting takeoff phase...");
+            exec_start_time = ros::Time::now();
+            
+            // Takeoff parameters (TODO: move to parameter server)
+            const double TAKEOFF_IMPULSE_TIME = 0.5;      // seconds
+            
+            ros::Rate takeoff_rate(50.0);  // 50Hz for takeoff control
+            std_msgs::Bool tkof_cmd;
+            
+            while(ros::ok()) {
+                double elapsed_time = (ros::Time::now() - exec_start_time).toSec();
+                
+                // Check if takeoff phase is complete
+                if(elapsed_time >= TAKEOFF_IMPULSE_TIME) {
+                    ROS_INFO("Planner: Takeoff phase completed at t=%.2fs", elapsed_time);
+                    takeoff_completed = true;
+                    
+                    // Send stop takeoff command
+                    tkof_cmd.data = false;
+                    tkof_cmd_pub.publish(tkof_cmd);
+                    break;
+                }
+                
+                // Send takeoff command to px4_cmd_sender
+                tkof_cmd.data = true;
+                tkof_cmd_pub.publish(tkof_cmd);
+                
+                ROS_INFO_THROTTLE(0.5, "Planner: Sending takeoff command [%.2fs]", elapsed_time);
+                
+                takeoff_rate.sleep();
+            }
+        }
+
+        // Motion generation with replanning
         motion::MotionGenerator motion_gen;
         
-        motion_gen.generateMotionFrameSet(local_pos,local_vel,local_acc,
-                                        target_pos,target_vel,target_acc,
-                                        duration);
-        
-        // Get polynomial coefficients
-        auto x_coeffs = motion_gen.getXCoeffs();
-        auto y_coeffs = motion_gen.getYCoeffs();
-        auto z_coeffs = motion_gen.getZCoeffs();
-        auto yaw_coeffs = motion_gen.getYawCoeffs();
-        
-        // Package trajectory message
-        landing_planner::Trajectory traj_msg;
-        traj_msg.header.stamp = ros::Time::now();
-        traj_msg.header.frame_id = "map";
-        
-        // Copy coefficients
-        std::copy(x_coeffs.begin(), x_coeffs.end(), traj_msg.x_coeffs.begin());
-        std::copy(y_coeffs.begin(), y_coeffs.end(), traj_msg.y_coeffs.begin());
-        std::copy(z_coeffs.begin(), z_coeffs.end(), traj_msg.z_coeffs.begin());
-        std::copy(yaw_coeffs.begin(), yaw_coeffs.end(), traj_msg.yaw_coeffs.begin());
-        
-        traj_msg.duration = duration;
-        
-        // Publish trajectory
-        planned_traj_pub.publish(traj_msg);
+        // Fixed-frequency replanning
+        const double replanning_frequency = 1.0; // Hz
+        const double dt_replan = 1.0 / replanning_frequency;
+        ros::Rate replanning_rate(replanning_frequency);
 
-    
-        // while(ros::ok()){}    
+        while (duration > 1.0) {
+            motion_gen.generateMotionFrameSet(local_pos,local_vel,local_acc,
+                                            target_pos,target_vel,target_acc,
+                                            duration);
+            // Get polynomial coefficients
+            auto x_coeffs = motion_gen.getXCoeffs();
+            auto y_coeffs = motion_gen.getYCoeffs();
+            auto z_coeffs = motion_gen.getZCoeffs();
+            auto yaw_coeffs = motion_gen.getYawCoeffs();
+            
+            // Package trajectory message
+            landing_planner::Trajectory traj_msg;
+            traj_msg.header.stamp = ros::Time::now();
+            traj_msg.header.frame_id = "map";
+            
+            // Copy coefficients
+            std::copy(x_coeffs.begin(), x_coeffs.end(), traj_msg.x_coeffs.begin());
+            std::copy(y_coeffs.begin(), y_coeffs.end(), traj_msg.y_coeffs.begin());
+            std::copy(z_coeffs.begin(), z_coeffs.end(), traj_msg.z_coeffs.begin());
+            std::copy(yaw_coeffs.begin(), yaw_coeffs.end(), traj_msg.yaw_coeffs.begin());
+            
+            traj_msg.duration = duration;
+            
+            // Publish trajectory
+            planned_traj_pub.publish(traj_msg);
+            duration -= dt_replan;
+            replanning_rate.sleep();
+        }
         ROS_INFO("Planner: Plan request processing complete.");
         plan_request_received = false;
     }
