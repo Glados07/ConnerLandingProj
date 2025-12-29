@@ -1,0 +1,5 @@
+<launch>
+    <node pkg="offb_arm_default" type="offb_arm_init" name="default_offb_arm_process" output="screen"/>
+    <node pkg="def_idling" type="default_idle" name="default_idling_process" output="screen"/>
+    <node pkg="misc_util" type="gndTru_to_odom" name="gndTru_to_odom_process" output="screen"/>
+</launch>

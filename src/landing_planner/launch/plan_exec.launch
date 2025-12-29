@@ -1,0 +1,5 @@
+<launch>
+    <node pkg="landing_planner" type="landing_planner_node" name="landing_planner_process" output="screen"/>
+    <node pkg="landing_planner" type="user_input_node" name="user_input_process" output="screen"/>
+    <node pkg="landing_planner" type="px4_cmd_sender_node" name="px4_cmd_sender_process" output="screen"/>
+</launch>
